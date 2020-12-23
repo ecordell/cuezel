@@ -16,7 +16,12 @@ dyncr.image.tar: bin/dyncr
 
 .PHONY: provision
 provision: dyncr.image.tar
-	$(GO) run ./cmd/provision --kind.image=dyncr.image.tar
+	$(GO) run ./cmd/provision --kind.image=dyncr.image.tar --cleanup-cluster=false
+
+.PHONY: apply
+apply: dyncr.image.tar
+	$(eval NAME=$(shell kind get clusters | head -1))
+	$(GO) run ./cmd/provision --kind.image=dyncr.image.tar --kind.name=$(NAME) --cleanup-cluster=false
 
 .PHONY: FORCE
 FORCE:

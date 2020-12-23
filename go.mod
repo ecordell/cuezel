@@ -5,9 +5,11 @@ go 1.15
 require (
 	github.com/coreos/go-oidc v2.1.0+incompatible
 	github.com/cuebernetes/cuebectl v0.3.1
+	github.com/elazarl/goproxy v0.0.0-20181111060418-2ce16c963a8a // indirect
 	github.com/go-logr/logr v0.3.0 // indirect
 	github.com/googleapis/gnostic v0.5.1 // indirect
 	github.com/imdario/mergo v0.3.10 // indirect
+	github.com/lib/pq v1.2.0 // indirect
 	github.com/onsi/ginkgo v1.14.2
 	github.com/onsi/gomega v1.10.4
 	github.com/pquerna/cachecontrol v0.0.0-20171018203845-0dec1b30a021 // indirect
@@ -21,3 +23,5 @@ require (
 	k8s.io/kubectl v0.20.0
 	sigs.k8s.io/kind v0.9.0
 )
+
+replace github.com/cuebernetes/cuebectl => ../cuebectl

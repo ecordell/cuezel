@@ -10,6 +10,8 @@ The test application is a static site with ingress and oidc auth.
 
 ## Usage
 
-- configure the environment variables for the oidc ingress (`manifests/flag.cue`)
+- add `127.0.0.1 dyncr.localhost` to `/etc/hosts`
+    - hydra requires non-https urls to end in `.localhost`
 - `make provision`
-- hydra is deployed within the cluster but currently unused
+    - have to configure coredns for redirects - can't use hostalias for nginx ingress
+- visit `dyncr.localhost`

@@ -50,14 +50,37 @@ FlagIngress: {
 		name:      "flag-ingress"
 		namespace: FlagNamespace.metadata.name
 		annotations: {
-            "nginx.ingress.kubernetes.io/auth-url": "https://$host/auth/verify"
-            "nginx.ingress.kubernetes.io/auth-signin": "https://$host/auth/signin?rd=$escaped_request_uri"
+            "nginx.ingress.kubernetes.io/auth-url": "http://$host/auth/verify"
+            "nginx.ingress.kubernetes.io/auth-signin": "http://$host/auth/signin"
         }
 	}
 	spec: rules: [{
 		http: paths: [
         {
 			path: "/"
+			pathType: "Prefix"
+			backend: {
+				service: {
+            		name: "flag-service"
+            		port: "number": 8080
+				}
+			}
+		}
+		]
+	}]
+}
+
+FaviconIngress: {
+	apiVersion: "networking.k8s.io/v1"
+	kind:       "Ingress"
+	metadata: {
+		name:      "favicon-ingress"
+		namespace: FlagNamespace.metadata.name
+	}
+	spec: rules: [{
+		http: paths: [
+        {
+			path: "/favicon.ico"
 			pathType: "Prefix"
 			backend: {
 				service: {
@@ -77,7 +100,15 @@ OidcNamespace: #Namespace & {
 	}
 }
 
+#HydraReady: {
+    if len([ for c in HydraDeployment.status.conditions if c.type == "Available" && c.status =="True" {c} ]) > 0 {
+        ready: true
+    }
+}
+
 OidcProxy: #Deployment & {
+    _wait: !#HydraReady.ready
+
 	metadata: {
 		name:      "oidc-ingress"
 		namespace: OidcNamespace.metadata.name
@@ -88,6 +119,10 @@ OidcProxy: #Deployment & {
 		selector: matchLabels: "app.kubernetes.io/name": "oidc-ingress"
 		template: {
 			metadata: labels: "app.kubernetes.io/name": "oidc-ingress"
+			spec: hostAliases: [{
+		      ip: IngressControllerService.spec.clusterIP,
+              hostnames: ["dyncr.localhost"]
+			}]
 			spec: containers: [{
 				name:            "oidc-ingress"
 				image:           "quay.io/ecordell/dyncr:local"
@@ -100,16 +135,20 @@ OidcProxy: #Deployment & {
 				env: [
 				    {
 					    name: "PROVIDER"
-					    value: "SETME"
+					    value: "http://dyncr.localhost/hydra/"
 					},
-                    {
-                        name: "CLIENT_ID"
-                        value: "SETME"
-                    },
-                    {
-                        name: "CLIENT_SECRET"
-                        value: "SETME"
-                    }
+					{
+					    name: "REGISTRATION_URI"
+					    value: "http://\(AdminService.metadata.name).\(AdminService.metadata.namespace).svc.cluster.local:\(AdminService.spec.ports[0].port)/clients"
+					},
+					{
+					    name: "REDIRECT_URI",
+					    value: "http://dyncr.localhost/auth/callback"
+					},
+					{
+					    name: "LOGIN_URL"
+					    value: "http://dyncr.localhost/login"
+					},
 				]
 			}]
 		}
@@ -148,4 +187,52 @@ OidcIngress: {
 		}
 		]
 	}]
+}
+
+CoreDNSConfigMap: {
+apiVersion: "v1"
+kind: "ConfigMap"
+metadata: name: "coredns"
+metadata: namespace: "kube-system"
+data:
+  Corefile: """
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        rewrite {
+           name regex dyncr.localhost ingress-nginx-controller.ingress-nginx.svc.cluster.local
+           answer name ingress-nginx-controller.ingress-nginx.svc.cluster.local dyncr.localhost
+        }
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+  """
+}
+
+#OidcReady: {
+    if len([ for c in OidcProxy.status.conditions if c.type == "Available" && c.status =="True" {c} ]) > 0 {
+        ready: true
+    }
+}
+
+ReadyConfigMap: {
+    apiVersion: "v1"
+    kind: "ConfigMap"
+    metadata: name: "ready"
+    metadata: namespace: FlagNamespace.metadata.name
+    _wait: !#OidcReady.ready
 }

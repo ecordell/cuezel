@@ -13,3 +13,6 @@
 
 # Images for kube
 *.image.tar
+
+# Binaries
+bin/

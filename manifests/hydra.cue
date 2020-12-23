@@ -56,18 +56,18 @@ HydraConfig: #ConfigMap & {
 	}
 	data: "config.yaml": """
 		serve:
-		  admin:
-			port: 4445
-		  public:
-			port: 4444
-		  tls:
-			allow_termination_from:
-			- 10.0.0.0/8
-			- 172.16.0.0/12
-			- 192.168.0.0/16
-		urls:
-			self: {}
-	"""
+			cookies:
+				same_site_mode: Lax:
+			admin:
+				port: 4445
+		  	public:
+				port: 4444
+			tls:
+				allow_termination_from:
+				- 10.0.0.0/8
+				- 172.16.0.0/12
+				- 192.168.0.0/16
+		"""
 }
 
 Secrets: #Secret & {
@@ -214,8 +214,24 @@ HydraDeployment: #Deployment & {
 					}
 					env: [{
 						name:  "URLS_SELF_ISSUER"
-						value: "http://127.0.0.1:4444/"
+						value: "http://dyncr.localhost/hydra"
 					}, {
+                        name:  "URLS_SELF_PUBLIC"
+                        value: "http://dyncr.localhost/hydra"
+                    },
+                    {
+                        name: "URLS_LOGIN"
+                        value: "http://dyncr.localhost/login"
+                    },
+                    {
+                        name: "URLS_CONSENT"
+                        value: "http://dyncr.localhost/consent"
+                    },
+                    {
+                        name: "URLS_LOGOUT"
+                        value: "http://dyncr.localhost/logout"
+                    },
+                    {
 						name:  "DSN"
 						value: "memory"
 					}, {
@@ -230,10 +246,168 @@ HydraDeployment: #Deployment & {
 							name: "hydra"
 							key:  "secretsCookie"
 						}
+					},{
+					    name: "LOG_LEVEL"
+					    value: "debug"
+					},{
+					    name: "SERVE_COOKIES_SAME_SITE_MODE"
+					    value: "Lax"
 					}]
 					resources: {}
 				}]
 			}
 		}
 	}
+}
+
+HydraIngress: {
+	apiVersion: "networking.k8s.io/v1"
+	kind:       "Ingress"
+	metadata: {
+		name:      "hydra-ingress"
+		namespace: HydraNamespace.metadata.name
+		annotations:  "nginx.ingress.kubernetes.io/rewrite-target": "/$1"
+	}
+	spec: rules: [{
+		http: paths: [
+		{
+            path: "/hydra/(.*)"
+            pathType: "Prefix"
+            backend: {
+                service: {
+                    name: "hydra-public"
+                    port: "number": PublicService.spec.ports[0].port
+                }
+            }
+		},
+		{
+			path: "/admin/(.*)"
+			pathType: "Prefix"
+			backend: {
+				service: {
+					name: "hydra-admin"
+					port: "number": AdminService.spec.ports[0].port
+				}
+			}
+        }
+		]
+	}]
+}
+
+HydraLoginDepoyment: #Deployment & {
+    metadata: {
+        name:      "hydra-login"
+        namespace: HydraNamespace.metadata.name
+        labels: {
+            "app.kubernetes.io/name":     "hydralogin"
+            "app.kubernetes.io/instance": "hydralogin"
+            "app.kubernetes.io/version":  "v1.9.0"
+        }
+    }
+    spec: {
+        replicas: 1
+        selector: matchLabels: {
+            "app.kubernetes.io/name":     "hydralogin"
+            "app.kubernetes.io/instance": "hydralogin"
+        }
+        template: {
+            metadata: {
+                labels: {
+                    "app.kubernetes.io/name":     "hydralogin"
+                    "app.kubernetes.io/instance": "hydralogin"
+                    "app.kubernetes.io/version":  "v1.9.0"
+                }
+            }
+            spec: {
+          		hostAliases: [{
+				  ip: IngressControllerService.spec.clusterIP,
+				  hostnames: ["dyncr.localhost"]
+				}]
+                containers: [{
+                    name:            "hydra-login"
+                    image:           "oryd/hydra-login-consent-node:v1.9.0-alpha.3"
+                    imagePullPolicy: "IfNotPresent"
+                    ports: [{
+                        name:          "http"
+                        containerPort: 3000
+                        protocol:      "TCP"
+                    }]
+                    env: [{
+                       name:  "HYDRA_ADMIN_URL"
+                       value: "http://dyncr.localhost/admin"
+                    }]
+                    resources: {}
+                }]
+            }
+        }
+    }
+ }
+
+
+LoginService: #Service & {
+	metadata: {
+		name:      "hydra-login"
+		namespace: HydraNamespace.metadata.name
+		labels: {
+			"app.kubernetes.io/name":     "hydralogin"
+			"app.kubernetes.io/instance": "hydralogin"
+			"app.kubernetes.io/version":  "v1.9.0"
+		}
+	}
+	spec: {
+		type: "ClusterIP"
+		ports: [{
+			port:       3000
+			targetPort: "http"
+			protocol:   "TCP"
+			name:       "http"
+		}]
+		selector: {
+			"app.kubernetes.io/name":     "hydralogin"
+			"app.kubernetes.io/instance": "hydralogin"
+		}
+	}
+}
+
+HydraLoginIngress: {
+	apiVersion: "networking.k8s.io/v1"
+	kind:       "Ingress"
+	metadata: {
+		name:      "login-ingress"
+		namespace: HydraNamespace.metadata.name
+	}
+	spec: rules: [{
+		http: paths: [
+		{
+            path: "/login"
+            pathType: "Prefix"
+            backend: {
+                service: {
+                    name: "hydra-login"
+                    port: "number": LoginService.spec.ports[0].port
+                }
+            }
+		},
+        {
+            path: "/consent"
+            pathType: "Prefix"
+            backend: {
+                service: {
+                    name: "hydra-login"
+                    port: "number": LoginService.spec.ports[0].port
+                }
+            }
+        },
+        {
+            path: "/logout"
+            pathType: "Prefix"
+            backend: {
+                service: {
+                    name: "hydra-login"
+                    port: "number": LoginService.spec.ports[0].port
+                }
+            }
+        }
+		]
+	}]
 }

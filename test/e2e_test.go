@@ -38,7 +38,7 @@ var _ = BeforeSuite(func() {
 	f := cmdutil.NewFactory(flags)
 	kubeconfig := f.ToRawKubeConfigLoader().ConfigAccess().GetExplicitFile()
 	archives := strings.Split(*images, ",")
-	deprovision, err = provision.Provision(kubeconfig, archives)
+	deprovision, err = provision.Provision("", kubeconfig, archives)
 	Expect(err).ToNot(HaveOccurred())
 
 	k, err = f.DynamicClient()
@@ -51,7 +51,7 @@ var _ = BeforeSuite(func() {
 
 	mapper, err := f.ToRESTMapper()
 	Expect(err).To(Succeed())
-	err = apply.CueDir(context.Background(), os.Stdout, k, mapper, "../manifests", false)
+	_, err = apply.CueDir(context.Background(), os.Stdout, k, mapper, "../manifests", false)
 	Expect(err).To(Succeed())
 })
 

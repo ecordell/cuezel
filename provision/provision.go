@@ -14,8 +14,10 @@ import (
 )
 
 
-func Provision(kubeconfig string, images []string) (deprovision func(), err error) {
-	name := fmt.Sprintf("kind-%s", rand.String(16))
+func Provision(name, kubeconfig string, images []string) (deprovision func(), err error) {
+	if name == "" {
+		name = fmt.Sprintf("kind-%s", rand.String(16))
+	}
 	dir, err := ioutil.TempDir("", name)
 	if err != nil {
 		err = fmt.Errorf("failed to create temporary directory: %s", err.Error())
@@ -36,11 +38,22 @@ func Provision(kubeconfig string, images []string) (deprovision func(), err erro
 		})
 	}
 
-	err = provider.Create(
-		name,
-		cluster.CreateWithWaitForReady(5*time.Minute),
-		cluster.CreateWithKubeconfigPath(kubeconfig),
-		cluster.CreateWithRawConfig([]byte(`
+	var clusters []string
+	clusters, err = provider.List()
+
+	needsCluster := true
+	for _, c := range clusters {
+		if c == name {
+			needsCluster = false
+		}
+	}
+
+	if needsCluster {
+		err = provider.Create(
+			name,
+			cluster.CreateWithWaitForReady(5*time.Minute),
+			cluster.CreateWithKubeconfigPath(kubeconfig),
+			cluster.CreateWithRawConfig([]byte(`
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -59,10 +72,11 @@ nodes:
     hostPort: 443
     protocol: TCP
 `)),
-	)
-	if err != nil {
-		err = fmt.Errorf("failed to create kind cluster: %s", err.Error())
-		return
+		)
+		if err != nil {
+			err = fmt.Errorf("failed to create kind cluster: %s", err.Error())
+			return
+		}
 	}
 
 	nodes, err := provider.ListNodes(name)

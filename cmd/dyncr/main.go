@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/coreos/go-oidc"
 	"golang.org/x/oauth2"
@@ -20,18 +24,130 @@ const (
 var provider *oidc.Provider
 var verifier *oidc.IDTokenVerifier
 var providerName = os.Getenv("PROVIDER")
-var clientID = os.Getenv("CLIENT_ID")
-var clientSecret = os.Getenv("CLIENT_SECRET")
+var endpoint = oauth2.Endpoint{}
+var clientID = ""
+var clientSecret = ""
+
+type (
+	// https://openid.net/specs/openid-connect-registration-1_0.html#RegistrationRequest
+	ClientRegistration struct {
+		Name                    string   `json:"client_name"`
+		ResponseTypes           []string `json:"response_types"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+		InitiateLoginURI        string   `json:"initiate_login_uri"`
+		RedirectURIs            []string `json:"redirect_uris"`
+		ApplicationType         string   `json:"application_type"`
+		FrontchannelLogoutURI   string   `json:"frontchannel_logout_uri"`
+	}
+
+	// https://openid.net/specs/openid-connect-registration-1_0.html#RegistrationResponse
+	// https://openid.net/specs/openid-connect-registration-1_0.html#RegistrationError
+	ClientRegistrationResponse struct {
+		Error            string `json:"error,omitempty"`
+		ErrorDescription string `json:"error_description,omitempty"`
+
+		Client
+	}
+
+	Client struct {
+		Name                    string   `json:"client_name,omitempty"`
+		ID                      string   `json:"client_id"`
+		Secret                  string   `json:"client_secret,omitempty"`
+		RedirectURIs            []string `json:"redirect_uris,omitempty"`
+		ResponseTypes           []string `json:"response_types,omitempty"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
+		InitiateLoginURI        string   `json:"initiate_login_uri,omitempty"`
+		ApplicationType         string   `json:"application_type,omitempty"`
+		FrontchannelLogoutURI   string   `json:"frontchannel_logout_uri,omitempty"`
+		IssuedAt                jsonTime `json:"client_id_issued_at,omitempty"`
+		SecretExpiresAt         jsonTime `json:"client_secret_expires_at"`
+	}
+)
+
+type jsonTime time.Time
+
+func (j *jsonTime) UnmarshalJSON(b []byte) error {
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	var unix int64
+
+	if t, err := n.Int64(); err == nil {
+		unix = t
+	} else {
+		f, err := n.Float64()
+		if err != nil {
+			return err
+		}
+		unix = int64(f)
+	}
+	*j = jsonTime(time.Unix(unix, 0))
+	return nil
+}
+
+func (j jsonTime) MarshalJSON() ([]byte, error) {
+	return json.Marshal(json.Number(strconv.FormatInt(time.Time(j).Unix(), 10)))
+}
 
 func main() {
 	var err error
 	provider, err = oidc.NewProvider(context.Background(), providerName)
 	if err != nil {
+		// ignore error because provider doesn't match issuer
 		log.Fatal(err)
 	}
+
+	reg := ClientRegistration{
+		Name: os.Getenv("POD_NAME"),
+		RedirectURIs: []string{os.Getenv("REDIRECT_URI")},
+		TokenEndpointAuthMethod: "client_secret_post",
+		// TODO: is this needed if it's already configured in hydra?
+		InitiateLoginURI: os.Getenv("LOGIN_URL"),
+	}
+	regBytes, err := json.Marshal(reg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	req, err := http.NewRequest("POST", os.Getenv("REGISTRATION_URI"), bytes.NewBuffer(regBytes))
+	if err != nil {
+		log.Fatal(err)
+	}
+	req.Header = map[string][]string{"Content-Type": {"application/json"}, "Accept": {"application/json"}}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var regResp ClientRegistrationResponse
+	if err := json.Unmarshal(body, &regResp); err != nil {
+		log.Fatal(err)
+	}
+
+	clientID = regResp.ID
+	clientSecret = regResp.Secret
+
+	fmt.Println(regResp.RedirectURIs)
+
 	verifier = provider.Verifier(
 		&oidc.Config{ClientID: clientID, SupportedSigningAlgs: []string{"RS256"}},
 	)
+
+	if len(clientID) == 0 || len(clientSecret) == 0 {
+		log.Fatal("registration failed")
+	}
+
+	endpoint = provider.Endpoint()
+	// should match token_endpoint_auth_method
+	endpoint.AuthStyle = oauth2.AuthStyleInParams
+
 	http.HandleFunc("/auth/verify", verifyHandler)
 	http.HandleFunc("/auth/signin", signinHandler)
 	http.HandleFunc("/auth/callback", callbackHandler)
@@ -73,8 +189,8 @@ func signinHandler(w http.ResponseWriter, r *http.Request) {
 	config := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  redirectURL(r),
+		Endpoint:     endpoint,
+		RedirectURL:  redirectURL(),
 		Scopes:       []string{"openid"},
 	}
 	http.Redirect(w, r, config.AuthCodeURL(state), http.StatusFound)
@@ -86,11 +202,12 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, "Invalid state")
 	}
+
 	config := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		Endpoint:     provider.Endpoint(),
-		RedirectURL:  redirectURL(r),
+		Endpoint:     endpoint,
+		RedirectURL:  redirectURL(),
 		Scopes:       []string{"openid"},
 	}
 
@@ -127,17 +244,6 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func redirectURL(r *http.Request) string {
-	host := r.Host
-	if h := r.Header.Get("X-Original-Url"); h != "" {
-		u, err := url.Parse(h)
-		if err == nil {
-			host = u.Hostname()
-		}
-	}
-	rd := r.URL.Query().Get("rd")
-	if rd != "" {
-		rd = "?rd=" + rd
-	}
-	return fmt.Sprintf("http://%v/auth/callback%v", host, rd)
+func redirectURL() string {
+	return os.Getenv("REDIRECT_URI")
 }
