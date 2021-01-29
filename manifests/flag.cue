@@ -119,13 +119,9 @@ OidcProxy: #Deployment & {
 		selector: matchLabels: "app.kubernetes.io/name": "oidc-ingress"
 		template: {
 			metadata: labels: "app.kubernetes.io/name": "oidc-ingress"
-			spec: hostAliases: [{
-		      ip: IngressControllerService.spec.clusterIP,
-              hostnames: ["dyncr.localhost"]
-			}]
 			spec: containers: [{
 				name:            "oidc-ingress"
-				image:           "quay.io/ecordell/dyncr:local"
+				image:           DyncrImage.name,
 				imagePullPolicy: "IfNotPresent"
 				ports: [{
 					name:          "http-public"

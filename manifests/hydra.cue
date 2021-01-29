@@ -319,10 +319,6 @@ HydraLoginDepoyment: #Deployment & {
                 }
             }
             spec: {
-          		hostAliases: [{
-				  ip: IngressControllerService.spec.clusterIP,
-				  hostnames: ["dyncr.localhost"]
-				}]
                 containers: [{
                     name:            "hydra-login"
                     image:           "oryd/hydra-login-consent-node:v1.9.0-alpha.3"

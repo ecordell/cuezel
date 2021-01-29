@@ -32,17 +32,134 @@ type StructLit struct {
 	Src   ast.Node // ast.File or ast.StructLit
 	Decls []Decl
 
+	// TODO: record the merge order somewhere.
+
+	// The below fields are redundant to Decls and are computed with Init.
+
+	// field marks the optional conjuncts of all explicit Fields.
+	// Required Fields are marked as empty
+	Fields []FieldInfo
+
+	Dynamic []*DynamicField
+
+	// excluded are all literal fields that already exist.
+	Bulk []*BulkOptionalField
+
+	Additional  []Expr
+	HasEmbed    bool
+	IsOpen      bool // has a ...
+	initialized bool
+
+	types OptionalType
+
 	// administrative fields like hasreferences.
 	// hasReferences bool
+}
+
+func (o *StructLit) IsFile() bool {
+	_, ok := o.Src.(*ast.File)
+	return ok
+}
+
+type FieldInfo struct {
+	Label    Feature
+	Optional []Node
+}
+
+func (x *StructLit) HasOptional() bool {
+	return x.types&(HasField|HasPattern|HasAdditional) != 0
 }
 
 func (x *StructLit) Source() ast.Node { return x.Src }
 
 func (x *StructLit) evaluate(c *OpContext) Value {
 	e := c.Env(0)
-	v := &Vertex{Conjuncts: []Conjunct{{e, x, 0}}}
-	c.Unifier.Unify(c, v, Finalized) // TODO: also partial okay?
+	v := &Vertex{Conjuncts: []Conjunct{{e, x, CloseInfo{}}}}
+	// evaluate may not finalize a field, as the resulting value may be
+	// used in a context where more conjuncts are added. It may also lead
+	// to disjuncts being in a partially expanded state, leading to
+	// misaligned nodeContexts.
+	c.Unifier.Unify(c, v, AllArcs)
 	return v
+}
+
+// TODO: remove this method
+func (o *StructLit) MarkField(f Feature) {
+	o.Fields = append(o.Fields, FieldInfo{Label: f})
+}
+
+func (o *StructLit) Init() {
+	if o.initialized {
+		return
+	}
+	o.initialized = true
+	for _, d := range o.Decls {
+		switch x := d.(type) {
+		case *Field:
+			if o.fieldIndex(x.Label) < 0 {
+				o.Fields = append(o.Fields, FieldInfo{Label: x.Label})
+			}
+
+		case *OptionalField:
+			p := o.fieldIndex(x.Label)
+			if p < 0 {
+				p = len(o.Fields)
+				o.Fields = append(o.Fields, FieldInfo{Label: x.Label})
+			}
+			o.Fields[p].Optional = append(o.Fields[p].Optional, x)
+			o.types |= HasField
+
+		case *DynamicField:
+			o.Dynamic = append(o.Dynamic, x)
+			o.types |= HasDynamic
+
+		case Expr:
+			o.HasEmbed = true
+
+		case *ForClause, Yielder:
+
+		case *BulkOptionalField:
+			o.Bulk = append(o.Bulk, x)
+			o.types |= HasPattern
+
+		case *Ellipsis:
+			expr := x.Value
+			if x.Value == nil {
+				o.IsOpen = true
+				o.types |= IsOpen
+				// TODO(perf): encode more efficiently.
+				expr = &Top{}
+			} else {
+				o.types |= HasAdditional
+			}
+			o.Additional = append(o.Additional, expr)
+
+		default:
+			panic("unreachable")
+		}
+	}
+}
+
+func (o *StructLit) fieldIndex(f Feature) int {
+	for i := range o.Fields {
+		if o.Fields[i].Label == f {
+			return i
+		}
+	}
+	return -1
+}
+
+func (o *StructLit) OptionalTypes() OptionalType {
+	return o.types
+}
+
+func (o *StructLit) IsOptional(label Feature) bool {
+	for _, f := range o.Fields {
+		if f.Label == label && len(f.Optional) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // FIELDS
@@ -168,7 +285,8 @@ func (x *ListLit) Source() ast.Node {
 
 func (x *ListLit) evaluate(c *OpContext) Value {
 	e := c.Env(0)
-	v := &Vertex{Conjuncts: []Conjunct{{e, x, 0}}}
+	v := &Vertex{Conjuncts: []Conjunct{{e, x, CloseInfo{}}}}
+	// TODO: should be AllArcs and then use Finalize for builtins?
 	c.Unifier.Unify(c, v, Finalized) // TODO: also partial okay?
 	return v
 }
@@ -503,7 +621,7 @@ func (x *DynamicReference) resolve(ctx *OpContext) *Vertex {
 	frame := ctx.PushState(e, x.Src)
 	v := ctx.value(x.Label)
 	ctx.PopState(frame)
-	f := ctx.Label(v)
+	f := ctx.Label(x.Label, v)
 	return ctx.lookup(e.Vertex, pos(x), f)
 }
 
@@ -553,8 +671,11 @@ func (x *LetReference) Source() ast.Node {
 func (x *LetReference) resolve(c *OpContext) *Vertex {
 	e := c.Env(x.UpCount)
 	label := e.Vertex.Label
+	if x.X == nil {
+		panic("nil expression")
+	}
 	// Anonymous arc.
-	return &Vertex{Parent: nil, Label: label, Conjuncts: []Conjunct{{e, x.X, 0}}}
+	return &Vertex{Parent: nil, Label: label, Conjuncts: []Conjunct{{e, x.X, CloseInfo{}}}}
 }
 
 func (x *LetReference) evaluate(c *OpContext) Value {
@@ -582,7 +703,10 @@ func (x *SelectorExpr) Source() ast.Node {
 }
 
 func (x *SelectorExpr) resolve(c *OpContext) *Vertex {
-	n := c.node(x.X, Partial)
+	n := c.node(x, x.X, x.Sel.IsRegular())
+	if n == emptyNode {
+		return n
+	}
 	return c.lookup(n, x.Src.Sel.Pos(), x.Sel)
 }
 
@@ -605,9 +729,12 @@ func (x *IndexExpr) Source() ast.Node {
 
 func (x *IndexExpr) resolve(ctx *OpContext) *Vertex {
 	// TODO: support byte index.
-	n := ctx.node(x.X, Partial)
+	n := ctx.node(x, x.X, true)
 	i := ctx.value(x.Index)
-	f := ctx.Label(i)
+	if n == emptyNode {
+		return n
+	}
+	f := ctx.Label(x.Index, i)
 	return ctx.lookup(n, x.Src.Index.Pos(), f)
 }
 
@@ -765,7 +892,7 @@ func (x *UnaryExpr) Source() ast.Node {
 }
 
 func (x *UnaryExpr) evaluate(c *OpContext) Value {
-	if !c.concreteIsPossible(x.X) {
+	if !c.concreteIsPossible(x.Op, x.X) {
 		return nil
 	}
 	v := c.value(x.X)
@@ -830,12 +957,12 @@ func (x *BinaryExpr) evaluate(c *OpContext) Value {
 	env := c.Env(0)
 	if x.Op == AndOp {
 		// Anonymous Arc
-		v := &Vertex{Conjuncts: []Conjunct{{env, x, 0}}}
+		v := &Vertex{Conjuncts: []Conjunct{{env, x, CloseInfo{}}}}
 		c.Unifier.Unify(c, v, Finalized)
 		return v
 	}
 
-	if !c.concreteIsPossible(x.X) || !c.concreteIsPossible(x.Y) {
+	if !c.concreteIsPossible(x.Op, x.X) || !c.concreteIsPossible(x.Op, x.Y) {
 		return nil
 	}
 
@@ -872,11 +999,7 @@ func (x *BinaryExpr) evaluate(c *OpContext) Value {
 		return err
 	}
 
-	value := BinOp(c, x.Op, left, right)
-	if n, ok := value.(*Vertex); ok && n.IsList() {
-		n.UpdateStatus(Partial)
-	}
-	return value
+	return BinOp(c, x.Op, left, right)
 }
 
 // A CallExpr represents a call to a builtin.
@@ -899,49 +1022,94 @@ func (x *CallExpr) Source() ast.Node {
 
 func (x *CallExpr) evaluate(c *OpContext) Value {
 	fun := c.value(x.Fun)
+	var b *Builtin
+	switch f := fun.(type) {
+	case *Builtin:
+		b = f
+
+	case *BuiltinValidator:
+		// We allow a validator that takes no arguments accept the validated
+		// value to be called with zero arguments.
+		switch {
+		case f.Src != nil:
+			c.addErrf(0, pos(x.Fun),
+				"cannot call previously called validator %s", c.Str(x.Fun))
+
+		case f.Builtin.IsValidator(len(x.Args)):
+			v := *f
+			v.Src = x
+			return &v
+
+		default:
+			b = f.Builtin
+		}
+
+	default:
+		c.addErrf(0, pos(x.Fun), "cannot call non-function %s (type %s)",
+			c.Str(x.Fun), kind(fun))
+		return nil
+	}
 	args := []Value{}
-	for _, a := range x.Args {
+	for i, a := range x.Args {
 		expr := c.value(a)
-		if v, ok := expr.(*Vertex); ok {
-			// Remove the path of the origin for arguments. This results in
-			// more sensible error messages: an error should refer to the call
-			// site, not the original location of the argument.
-			// TODO: alternative, explicitly mark the argument number and use
-			// that in error messages.
-			w := *v
-			w.Parent = nil
-			args = append(args, &w)
-		} else {
+		switch v := expr.(type) {
+		case nil:
+			// There SHOULD be an error in the context. If not, we generate
+			// one.
+			c.Assertf(pos(x.Fun), c.HasErr(),
+				"argument %d to function %s is incomplete", i, c.Str(x.Fun))
+
+		case *Bottom:
+			// TODO(errors): consider adding an argument index for this errors.
+			// On the other hand, this error is really not related to the
+			// argument itself, so maybe it is good as it is.
+			c.AddBottom(v)
+
+		default:
 			args = append(args, expr)
 		}
 	}
 	if c.HasErr() {
 		return nil
 	}
-	b, _ := fun.(*Builtin)
-	if b == nil {
-		c.addErrf(0, pos(x.Fun), "cannot call non-function %s (type %s)",
-			c.Str(x.Fun), kind(fun))
-		return nil
+	if b.IsValidator(len(args)) {
+		return &BuiltinValidator{x, b, args}
 	}
-	result := b.call(c, x.Src, args)
+	result := b.call(c, pos(x), args)
 	if result == nil {
 		return nil
 	}
-	return c.eval(result)
+	return c.evalState(result, Partial)
 }
 
 // A Builtin is a value representing a native function call.
 type Builtin struct {
 	// TODO:  make these values for better type checking.
-	Params []Kind
+	Params []Param
 	Result Kind
 	Func   func(c *OpContext, args []Value) Expr
 
 	Package Feature
 	Name    string
-	// REMOVE: for legacy
-	Const string
+}
+
+type Param struct {
+	Name  Feature // name of the argument; mostly for documentation
+	Value Value   // Could become Value later, using disjunctions for defaults.
+}
+
+// Kind returns the kind mask of this parameter.
+func (p Param) Kind() Kind {
+	return p.Value.Kind()
+}
+
+// Default reports the default value for this Param or nil if there is none.
+func (p Param) Default() Value {
+	d, ok := p.Value.(*Disjunction)
+	if !ok || d.NumDefaults != 1 {
+		return nil
+	}
+	return d.Values[0]
 }
 
 func (x *Builtin) WriteName(w io.Writer, c *OpContext) {
@@ -950,65 +1118,81 @@ func (x *Builtin) WriteName(w io.Writer, c *OpContext) {
 
 // Kind here represents the case where Builtin is used as a Validator.
 func (x *Builtin) Kind() Kind {
-	if len(x.Params) == 0 {
-		return BottomKind
-	}
-	return x.Params[0]
+	return FuncKind
 }
 
-func (x *Builtin) validate(c *OpContext, v Value) *Bottom {
-	if x.Result != BoolKind {
-		return c.NewErrf(
-			"invalid validator %s: not a bool return", x.Name)
+func (x *Builtin) BareValidator() *BuiltinValidator {
+	if len(x.Params) != 1 ||
+		(x.Result != BoolKind && x.Result != BottomKind) {
+		return nil
 	}
-	if len(x.Params) != 1 {
-		return c.NewErrf(
-			"invalid validator %s: may only have one validator to be used without call", x.Name)
-	}
-	return validateWithBuiltin(c, nil, x, []Value{v})
+	return &BuiltinValidator{Builtin: x}
+}
+
+// IsValidator reports whether b should be interpreted as a Validator for the
+// given number of arguments.
+func (b *Builtin) IsValidator(numArgs int) bool {
+	return numArgs == len(b.Params)-1 &&
+		b.Result&^BoolKind == 0 &&
+		b.Params[numArgs].Default() == nil
 }
 
 func bottom(v Value) *Bottom {
 	if x, ok := v.(*Vertex); ok {
-		v = x.Value
+		v = x.Value()
 	}
 	b, _ := v.(*Bottom)
 	return b
 }
 
-func (x *Builtin) call(c *OpContext, call *ast.CallExpr, args []Value) Expr {
-	if len(x.Params)-1 == len(args) && x.Result == BoolKind {
-		// We have a custom builtin
-		return &BuiltinValidator{call, x, args}
-	}
-	switch {
-	case len(x.Params) < len(args):
-		c.addErrf(0, call.Rparen,
+func (x *Builtin) call(c *OpContext, p token.Pos, args []Value) Expr {
+	fun := x // right now always x.
+	if len(args) > len(x.Params) {
+		c.addErrf(0, p,
 			"too many arguments in call to %s (have %d, want %d)",
-			call.Fun, len(args), len(x.Params))
+			fun, len(args), len(x.Params))
 		return nil
-	case len(x.Params) > len(args):
-		c.addErrf(0, call.Rparen,
-			"not enough arguments in call to %s (have %d, want %d)",
-			call.Fun, len(args), len(x.Params))
-		return nil
+	}
+	for i := len(args); i < len(x.Params); i++ {
+		v := x.Params[i].Default()
+		if v == nil {
+			c.addErrf(0, p,
+				"not enough arguments in call to %s (have %d, want %d)",
+				fun, len(args), len(x.Params))
+			return nil
+		}
+		args = append(args, v)
 	}
 	for i, a := range args {
-		if x.Params[i] != BottomKind {
-			if b := bottom(a); b != nil {
-				return b
+		if x.Params[i].Kind() == BottomKind {
+			continue
+		}
+		if b := bottom(a); b != nil {
+			return b
+		}
+		if k := kind(a); x.Params[i].Kind()&k == BottomKind {
+			code := EvalError
+			b, _ := args[i].(*Bottom)
+			if b != nil {
+				code = b.Code
 			}
-			if k := kind(a); x.Params[i]&k == BottomKind {
-				code := EvalError
-				b, _ := args[i].(*Bottom)
-				if b != nil {
-					code = b.Code
-				}
-				c.addErrf(code, pos(a),
-					"cannot use %s (type %s) as %s in argument %d to %s",
-					a, k, x.Params[i], i+1, call.Fun)
-				return nil
+			c.addErrf(code, pos(a),
+				"cannot use %s (type %s) as %s in argument %d to %s",
+				a, k, x.Params[i].Kind(), i+1, fun)
+			return nil
+		}
+		v := x.Params[i].Value
+		if _, ok := v.(*BasicType); !ok {
+			env := c.Env(0)
+			x := &BinaryExpr{Op: AndOp, X: v, Y: a}
+			n := &Vertex{Conjuncts: []Conjunct{{env, x, CloseInfo{}}}}
+			c.Unifier.Unify(c, n, Finalized)
+			if _, ok := n.BaseValue.(*Bottom); ok {
+				c.addErrf(0, pos(a),
+					"cannot use %s as %s in argument %d to %s",
+					a, v, i+1, fun)
 			}
+			args[i] = n
 		}
 	}
 	return x.Func(c, args)
@@ -1022,37 +1206,52 @@ func (x *Builtin) Source() ast.Node { return nil }
 //    strings.MinRunes(4)
 //
 type BuiltinValidator struct {
-	Src     *ast.CallExpr
+	Src     *CallExpr
 	Builtin *Builtin
 	Args    []Value // any but the first value
 }
 
 func (x *BuiltinValidator) Source() ast.Node {
 	if x.Src == nil {
-		return nil
+		return x.Builtin.Source()
 	}
-	return x.Src
+	return x.Src.Source()
+}
+
+func (x *BuiltinValidator) Pos() token.Pos {
+	if src := x.Source(); src != nil {
+		return src.Pos()
+	}
+	return token.NoPos
 }
 
 func (x *BuiltinValidator) Kind() Kind {
-	return x.Builtin.Params[0]
+	return x.Builtin.Params[0].Kind()
 }
 
 func (x *BuiltinValidator) validate(c *OpContext, v Value) *Bottom {
 	args := make([]Value, len(x.Args)+1)
 	args[0] = v
 	copy(args[1:], x.Args)
-	return validateWithBuiltin(c, x.Src, x.Builtin, args)
+
+	return validateWithBuiltin(c, x.Pos(), x.Builtin, args)
 }
 
-func validateWithBuiltin(c *OpContext, src *ast.CallExpr, b *Builtin, args []Value) *Bottom {
+func validateWithBuiltin(c *OpContext, src token.Pos, b *Builtin, args []Value) *Bottom {
+	var severeness ErrorCode
+	var err errors.Error
+
 	res := b.call(c, src, args)
 	switch v := res.(type) {
 	case nil:
 		return nil
 
 	case *Bottom:
-		return v
+		if v == nil {
+			return nil // caught elsewhere, but be defensive.
+		}
+		severeness = v.Code
+		err = v.Err
 
 	case *Bool:
 		if v.B {
@@ -1076,7 +1275,15 @@ func validateWithBuiltin(c *OpContext, src *ast.CallExpr, b *Builtin, args []Val
 		}
 		buf.WriteString(")")
 	}
-	return c.NewErrf("invalid value %s (does not satisfy %s)", c.Str(args[0]), buf.String())
+
+	vErr := c.NewPosf(src, "invalid value %s (does not satisfy %s)", c.Str(args[0]), buf.String())
+	vErr.err = err
+
+	for _, v := range args {
+		vErr.AddPosition(v)
+	}
+
+	return &Bottom{Code: severeness, Err: vErr}
 }
 
 // A Disjunction represents a disjunction, where each disjunct may or may not
@@ -1103,7 +1310,7 @@ func (x *DisjunctionExpr) Source() ast.Node {
 
 func (x *DisjunctionExpr) evaluate(c *OpContext) Value {
 	e := c.Env(0)
-	v := &Vertex{Conjuncts: []Conjunct{{e, x, 0}}}
+	v := &Vertex{Conjuncts: []Conjunct{{e, x, CloseInfo{}}}}
 	c.Unifier.Unify(c, v, Finalized) // TODO: also partial okay?
 	// TODO: if the disjunction result originated from a literal value, we may
 	// consider the result closed to create more permanent errors.
@@ -1139,6 +1346,7 @@ type Disjunction struct {
 
 	// NumDefaults indicates the number of default values.
 	NumDefaults int
+	HasDefaults bool
 }
 
 func (x *Disjunction) Source() ast.Node { return x.Src }
@@ -1171,18 +1379,23 @@ func (x *ForClause) Source() ast.Node {
 }
 
 func (x *ForClause) yield(c *OpContext, f YieldFunc) {
-	n := c.node(x.Src, Finalized)
+	n := c.node(x, x.Src, true)
 	for _, a := range n.Arcs {
 		if !a.Label.IsRegular() {
 			continue
 		}
 
+		c.Unify(c, a, Partial)
+
 		n := &Vertex{status: Finalized}
 
 		// TODO: only needed if value label != _
-		b := *a
-		b.Label = x.Value
-		n.Arcs = append(n.Arcs, &b)
+
+		b := &Vertex{
+			Label:     x.Value,
+			BaseValue: a,
+		}
+		n.Arcs = append(n.Arcs, b)
 
 		if x.Key != 0 {
 			v := &Vertex{Label: x.Key}
@@ -1192,7 +1405,13 @@ func (x *ForClause) yield(c *OpContext, f YieldFunc) {
 			n.Arcs = append(n.Arcs, v)
 		}
 
-		x.Dst.yield(c.spawn(n), f)
+		sub := c.spawn(n)
+		saved := c.PushState(sub, x.Dst.Source())
+		x.Dst.yield(c, f)
+		if b := c.PopState(saved); b != nil {
+			c.AddBottom(b)
+			break
+		}
 		if c.HasErr() {
 			break
 		}
@@ -1243,9 +1462,15 @@ func (x *LetClause) Source() ast.Node {
 
 func (x *LetClause) yield(c *OpContext, f YieldFunc) {
 	n := &Vertex{Arcs: []*Vertex{
-		{Label: x.Label, Conjuncts: []Conjunct{{c.Env(0), x.Expr, 0}}},
+		{Label: x.Label, Conjuncts: []Conjunct{{c.Env(0), x.Expr, CloseInfo{}}}},
 	}}
-	x.Dst.yield(c.spawn(n), f)
+
+	sub := c.spawn(n)
+	saved := c.PushState(sub, x.Dst.Source())
+	x.Dst.yield(c, f)
+	if b := c.PopState(saved); b != nil {
+		c.AddBottom(b)
+	}
 }
 
 // A ValueClause represents the value part of a comprehension.

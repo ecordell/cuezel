@@ -137,7 +137,7 @@ func (e *Environment) evalCached(c *OpContext, x Expr) Value {
 		}
 		env, src := c.e, c.src
 		c.e, c.src = e, x.Source()
-		v = c.eval(x)
+		v = c.evalState(x, Partial)
 		c.e, c.src = env, src
 		e.cache[x] = v
 	}
@@ -161,7 +161,13 @@ type Vertex struct {
 	// Label is the feature leading to this vertex.
 	Label Feature
 
-	// TODO: move the following status fields to a separate struct.
+	// State:
+	//   eval: nil, BaseValue: nil -- unevaluated
+	//   eval: *,   BaseValue: nil -- evaluating
+	//   eval: *,   BaseValue: *   -- finalized
+	//
+	state *nodeContext
+	// TODO: move the following status fields to nodeContext.
 
 	// status indicates the evaluation progress of this vertex.
 	status VertexStatus
@@ -170,6 +176,7 @@ type Vertex struct {
 	// and additional constraints, as well as optional fields, should be
 	// ignored.
 	isData bool
+	Closed bool
 
 	// EvalCount keeps track of temporary dereferencing during evaluation.
 	// If EvalCount > 0, status should be considered to be EvaluatingArcs.
@@ -178,9 +185,9 @@ type Vertex struct {
 	// SelfCount is used for tracking self-references.
 	SelfCount int
 
-	// Value is the value associated with this vertex. For lists and structs
+	// BaseValue is the value associated with this vertex. For lists and structs
 	// this is a sentinel value indicating its kind.
-	Value Value
+	BaseValue BaseValue
 
 	// ChildErrors is the collection of all errors of children.
 	ChildErrors *Bottom
@@ -199,14 +206,30 @@ type Vertex struct {
 
 	// Structs is a slice of struct literals that contributed to this value.
 	// This information is used to compute the topological sort of arcs.
-	Structs []*StructLit
+	Structs []*StructInfo
+}
 
-	// Closed contains information about how to interpret field labels for the
-	// various conjuncts with respect to which fields are allowed in this
-	// Vertex. If allows all fields if it is nil.
-	// The evaluator will first check existing fields before using this. So for
-	// simple cases, an Acceptor can always return false to close the Vertex.
-	Closed Acceptor
+type StructInfo struct {
+	*StructLit
+
+	Env *Environment
+
+	CloseInfo
+
+	// Embed indicates the struct in which this struct is embedded (originally),
+	// or nil if this is a root structure.
+	// Embed   *StructInfo
+	// Context *RefInfo // the location from which this struct originates.
+	Disable bool
+
+	Embedding bool
+}
+
+func (s *StructInfo) useForAccept() bool {
+	if c := s.closeInfo; c != nil {
+		return !c.noCheck
+	}
+	return true
 }
 
 // VertexStatus indicates the evaluation progress of a Vertex.
@@ -228,6 +251,10 @@ const (
 	// nodeContext to allow reusing the computations done so far.
 	Partial
 
+	// AllArcs is request only. It must be past Partial, but
+	// before recursively resolving arcs.
+	AllArcs
+
 	// EvaluatingArcs indicates that the arcs of the Vertex are currently being
 	// evaluated. If this is encountered it indicates a structural cycle.
 	// Value does not have to be nil
@@ -246,13 +273,31 @@ func (v *Vertex) Status() VertexStatus {
 }
 
 func (v *Vertex) UpdateStatus(s VertexStatus) {
-	if v.status > s+1 {
-		panic(fmt.Sprintf("attempt to regress status from %d to %d", v.Status(), s))
-	}
-	if s == Finalized && v.Value == nil {
+	Assertf(v.status <= s+1, "attempt to regress status from %d to %d", v.Status(), s)
+
+	if s == Finalized && v.BaseValue == nil {
 		// panic("not finalized")
 	}
 	v.status = s
+}
+
+// Value returns the Value of v without definitions if it is a scalar
+// or itself otherwise.
+func (v *Vertex) Value() Value {
+	switch x := v.BaseValue.(type) {
+	case nil:
+		return nil
+	case *StructMarker, *ListMarker:
+		return v
+	case Value:
+		return x
+	default:
+		panic(fmt.Sprintf("unexpected type %T", v.BaseValue))
+	}
+}
+
+func (x *Vertex) IsConcrete() bool {
+	return x.Concreteness() <= Concrete
 }
 
 // IsData reports whether v should be interpreted in data mode. In other words,
@@ -268,6 +313,8 @@ func (v *Vertex) IsData() bool {
 func (v *Vertex) ToDataSingle() *Vertex {
 	w := *v
 	w.isData = true
+	w.state = nil
+	w.status = Finalized
 	return &w
 }
 
@@ -281,23 +328,28 @@ func (v *Vertex) ToDataAll() *Vertex {
 		}
 	}
 	w := *v
+	w.state = nil
+	w.status = Finalized
 
-	w.Value = toDataAll(w.Value)
+	w.BaseValue = toDataAll(w.BaseValue)
 	w.Arcs = arcs
 	w.isData = true
 	w.Conjuncts = make([]Conjunct, len(v.Conjuncts))
+	// TODO(perf): this is not strictly necessary for evaluation, but it can
+	// hurt performance greatly. Drawback is that it may disable ordering.
+	for _, s := range w.Structs {
+		s.Disable = true
+	}
 	copy(w.Conjuncts, v.Conjuncts)
 	for i, c := range w.Conjuncts {
-		w.Conjuncts[i].CloseID = 0
 		if v, _ := c.x.(Value); v != nil {
-			w.Conjuncts[i].x = toDataAll(v)
+			w.Conjuncts[i].x = toDataAll(v).(Value)
 		}
 	}
-	w.Closed = nil
 	return &w
 }
 
-func toDataAll(v Value) Value {
+func toDataAll(v BaseValue) BaseValue {
 	switch x := v.(type) {
 	default:
 		return x
@@ -319,7 +371,8 @@ func toDataAll(v Value) Value {
 		c := *x
 		c.Values = make([]Value, len(x.Values))
 		for i, v := range x.Values {
-			c.Values[i] = toDataAll(v)
+			// This case is okay because the source is of type Value.
+			c.Values[i] = toDataAll(v).(Value)
 		}
 		return &c
 	}
@@ -331,7 +384,7 @@ func toDataAll(v Value) Value {
 
 func (v *Vertex) IsErr() bool {
 	// if v.Status() > Evaluating {
-	if _, ok := v.Value.(*Bottom); ok {
+	if _, ok := v.BaseValue.(*Bottom); ok {
 		return true
 	}
 	// }
@@ -340,7 +393,7 @@ func (v *Vertex) IsErr() bool {
 
 func (v *Vertex) Err(c *OpContext, state VertexStatus) *Bottom {
 	c.Unify(c, v, state)
-	if b, ok := v.Value.(*Bottom); ok {
+	if b, ok := v.BaseValue.(*Bottom); ok {
 		return b
 	}
 	return nil
@@ -353,12 +406,12 @@ func (v *Vertex) Finalize(c *OpContext) {
 }
 
 func (v *Vertex) AddErr(ctx *OpContext, b *Bottom) {
-	v.Value = CombineErrors(nil, v.Value, b)
+	v.BaseValue = CombineErrors(nil, v.Value(), b)
 	v.UpdateStatus(Finalized)
 }
 
-func (v *Vertex) SetValue(ctx *OpContext, state VertexStatus, value Value) *Bottom {
-	v.Value = value
+func (v *Vertex) SetValue(ctx *OpContext, state VertexStatus, value BaseValue) *Bottom {
+	v.BaseValue = value
 	v.UpdateStatus(state)
 	return nil
 }
@@ -370,8 +423,8 @@ func ToVertex(v Value) *Vertex {
 		return x
 	default:
 		n := &Vertex{
-			status: Finalized,
-			Value:  x,
+			status:    Finalized,
+			BaseValue: x,
 		}
 		n.AddConjunct(MakeRootConjunct(nil, v))
 		return n
@@ -385,31 +438,16 @@ func Unwrap(v Value) Value {
 	if !ok {
 		return v
 	}
-	switch x.Value.(type) {
-	case *StructMarker, *ListMarker:
-		return v
-	default:
-		return x.Value
+	// b, _ := x.BaseValue.(*Bottom)
+	if n := x.state; n != nil && x.BaseValue == cycle {
+		if n.errs != nil && !n.errs.IsIncomplete() {
+			return n.errs
+		}
+		if n.scalar != nil {
+			return n.scalar
+		}
 	}
-}
-
-// Acceptor is a single interface that reports whether feature f is a valid
-// field label for this vertex.
-//
-// TODO: combine this with the StructMarker functionality?
-type Acceptor interface {
-	// Accept reports whether a given field is accepted as output.
-	// Pass an InvalidLabel to determine whether this is always open.
-	Accept(ctx *OpContext, f Feature) bool
-
-	// MatchAndInsert finds the conjuncts for optional fields, pattern
-	// constraints, and additional constraints that match f and inserts them in
-	// arc. Use f is 0 to match all additional constraints only.
-	MatchAndInsert(c *OpContext, arc *Vertex)
-
-	// OptionalTypes returns a bit field with the type of optional constraints
-	// that are represented by this Acceptor.
-	OptionalTypes() OptionalType
+	return x.Value()
 }
 
 // OptionalType is a bit field of the type of optional constraints in use by an
@@ -427,69 +465,91 @@ const (
 func (v *Vertex) Kind() Kind {
 	// This is possible when evaluating comprehensions. It is potentially
 	// not known at this time what the type is.
-	if v.Value == nil {
+	if v.BaseValue == nil {
 		return TopKind
 	}
-	return v.Value.Kind()
+	return v.BaseValue.Kind()
 }
 
 func (v *Vertex) OptionalTypes() OptionalType {
-	switch {
-	case v.Closed != nil:
-		return v.Closed.OptionalTypes()
-	case v.IsList():
-		return 0
-	default:
-		return IsOpen
+	var mask OptionalType
+	for _, s := range v.Structs {
+		mask |= s.OptionalTypes()
 	}
+	return mask
+}
+
+// IsOptional reports whether a field is explicitly defined as optional,
+// as opposed to whether it is allowed by a pattern constraint.
+func (v *Vertex) IsOptional(label Feature) bool {
+	for _, s := range v.Structs {
+		if s.IsOptional(label) {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *Vertex) accepts(ok, required bool) bool {
+	return ok || (!required && !v.Closed)
 }
 
 func (v *Vertex) IsClosed(ctx *OpContext) bool {
-	switch x := v.Value.(type) {
+	switch x := v.BaseValue.(type) {
 	case *ListMarker:
-		// TODO: use one mechanism.
-		if x.IsOpen {
-			return false
-		}
-		if v.Closed == nil {
-			return true
-		}
-		return !v.Closed.Accept(ctx, InvalidLabel)
+		return !x.IsOpen
 
 	case *StructMarker:
 		if x.NeedClose {
 			return true
 		}
-		if v.Closed == nil {
-			return false
-		}
-		return !v.Closed.Accept(ctx, InvalidLabel)
+		return v.Closed || isClosed(v)
 	}
 	return false
 }
 
+// TODO: return error instead of boolean? (or at least have version that does.)
 func (v *Vertex) Accept(ctx *OpContext, f Feature) bool {
-	if !v.IsClosed(ctx) || v.Lookup(f) != nil {
+	if v.IsList() {
+		if f.IsInt() {
+			// TODO(perf): use precomputed length.
+			if f.Index() < len(v.Elems()) {
+				return true
+			}
+		}
+		return !v.IsClosed(ctx)
+	}
+
+	if !f.IsString() || !v.IsClosed(ctx) || v.Lookup(f) != nil {
 		return true
 	}
-	if v.Closed != nil {
-		return v.Closed.Accept(ctx, f)
-	}
-	return false
+
+	// TODO(perf): collect positions in error.
+	defer ctx.ReleasePositions(ctx.MarkPositions())
+
+	return v.accepts(Accept(ctx, v, f))
 }
 
+// MatchAndInsert finds the conjuncts for optional fields, pattern
+// constraints, and additional constraints that match f and inserts them in
+// arc. Use f is 0 to match all additional constraints only.
 func (v *Vertex) MatchAndInsert(ctx *OpContext, arc *Vertex) {
-	if v.Closed == nil {
-		return
-	}
 	if !v.Accept(ctx, arc.Label) {
 		return
 	}
-	v.Closed.MatchAndInsert(ctx, arc)
+
+	// Go backwards to simulate old implementation.
+	for i := len(v.Structs) - 1; i >= 0; i-- {
+		s := v.Structs[i]
+		if s.Disable {
+			continue
+		}
+		s.MatchAndInsert(ctx, arc)
+	}
 }
 
 func (v *Vertex) IsList() bool {
-	_, ok := v.Value.(*ListMarker)
+	_, ok := v.BaseValue.(*ListMarker)
 	return ok
 }
 
@@ -531,27 +591,40 @@ func (v *Vertex) Source() ast.Node { return nil }
 
 // AddConjunct adds the given Conjuncts to v if it doesn't already exist.
 func (v *Vertex) AddConjunct(c Conjunct) *Bottom {
-	if v.Value != nil {
+	if v.BaseValue != nil {
 		// TODO: investigate why this happens at all. Removing it seems to
 		// change the order of fields in some cases.
 		//
 		// This is likely a bug in the evaluator and should not happen.
 		return &Bottom{Err: errors.Newf(token.NoPos, "cannot add conjunct")}
 	}
-	v.Conjuncts = append(v.Conjuncts, c)
+	v.addConjunct(c)
 	return nil
 }
 
-func (v *Vertex) AddStructs(a ...*StructLit) {
-outer:
-	for _, s := range a {
-		for _, t := range v.Structs {
-			if t == s {
-				continue outer
-			}
+func (v *Vertex) addConjunct(c Conjunct) {
+	for _, x := range v.Conjuncts {
+		if x == c {
+			return
 		}
-		v.Structs = append(v.Structs, s)
 	}
+	v.Conjuncts = append(v.Conjuncts, c)
+}
+
+func (v *Vertex) AddStruct(s *StructLit, env *Environment, ci CloseInfo) *StructInfo {
+	info := StructInfo{
+		StructLit: s,
+		Env:       env,
+		CloseInfo: ci,
+	}
+	for _, t := range v.Structs {
+		if *t == info {
+			return t
+		}
+	}
+	t := &info
+	v.Structs = append(v.Structs, t)
+	return t
 }
 
 // Path computes the sequence of Features leading from the root to of the
@@ -565,24 +638,11 @@ func appendPath(a []Feature, v *Vertex) []Feature {
 		return a
 	}
 	a = appendPath(a, v.Parent)
-	return append(a, v.Label)
-}
-
-func (v *Vertex) appendListArcs(arcs []*Vertex) (err *Bottom) {
-	for _, a := range arcs {
-		// TODO(list): BUG this only works if lists do not have definitions
-		// fields.
-		label, err := MakeLabel(a.Source(), int64(len(v.Arcs)), IntLabel)
-		if err != nil {
-			return &Bottom{Src: a.Source(), Err: err}
-		}
-		v.Arcs = append(v.Arcs, &Vertex{
-			Parent:    v,
-			Label:     label,
-			Conjuncts: a.Conjuncts,
-		})
+	if v.Label != 0 {
+		// A Label may be 0 for programmatically inserted nodes.
+		a = append(a, v.Label)
 	}
-	return nil
+	return a
 }
 
 // An Conjunct is an Environment-Expr pair. The Environment is the starting
@@ -591,13 +651,9 @@ type Conjunct struct {
 	Env *Environment
 	x   Node
 
-	// CloseID is a unique number that tracks a group of conjuncts that need
+	// CloseInfo is a unique number that tracks a group of conjuncts that need
 	// belong to a single originating definition.
-	CloseID ID
-}
-
-func (c *Conjunct) ID() ID {
-	return c.CloseID
+	CloseInfo CloseInfo
 }
 
 // TODO(perf): replace with composite literal if this helps performance.
@@ -605,10 +661,10 @@ func (c *Conjunct) ID() ID {
 // MakeRootConjunct creates a conjunct from the given environment and node.
 // It panics if x cannot be used as an expression.
 func MakeRootConjunct(env *Environment, x Node) Conjunct {
-	return MakeConjunct(env, x, 0)
+	return MakeConjunct(env, x, CloseInfo{})
 }
 
-func MakeConjunct(env *Environment, x Node, id ID) Conjunct {
+func MakeConjunct(env *Environment, x Node, id CloseInfo) Conjunct {
 	if env == nil {
 		// TODO: better is to pass one.
 		env = &Environment{}

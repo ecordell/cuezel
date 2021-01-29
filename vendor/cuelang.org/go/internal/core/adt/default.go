@@ -29,6 +29,10 @@ func Default(v Value) Value {
 func (d *Disjunction) Default() Value {
 	switch d.NumDefaults {
 	case 0:
+		if d.HasDefaults {
+			// empty disjunction
+			return &Bottom{}
+		}
 		return d
 	case 1:
 		return d.Values[0]
@@ -42,8 +46,10 @@ func (d *Disjunction) Default() Value {
 }
 
 // Default returns the default value or itself if there is no default.
+//
+// It also closes a list, representing its default value.
 func (v *Vertex) Default() *Vertex {
-	switch d := v.Value.(type) {
+	switch d := v.BaseValue.(type) {
 	default:
 		return v
 
@@ -52,12 +58,20 @@ func (v *Vertex) Default() *Vertex {
 
 		switch d.NumDefaults {
 		case 0:
+			if d.HasDefaults {
+				v = &Vertex{
+					Parent:    v.Parent,
+					status:    Finalized,
+					BaseValue: &Bottom{},
+				}
+			}
 			return v
 		case 1:
 			w = d.Values[0]
 		default:
 			x := *v
-			x.Value = &Disjunction{
+			x.state = nil
+			x.BaseValue = &Disjunction{
 				Src:         d.Src,
 				Values:      d.Values[:d.NumDefaults],
 				NumDefaults: 0,
@@ -78,8 +92,8 @@ func (v *Vertex) Default() *Vertex {
 		m.IsOpen = false
 
 		w := *v
-		w.Closed = nil
-		w.Value = &m
+		w.BaseValue = &m
+		w.state = nil
 		return &w
 	}
 }
