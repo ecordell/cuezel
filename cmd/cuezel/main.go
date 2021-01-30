@@ -2,40 +2,28 @@ package main
 
 import (
 	"context"
-	"cuelang.org/go/cue"
-	"cuelang.org/go/cue/load"
 	"fmt"
-	"github.com/cuebernetes/cuebectl/pkg/apply"
-	cuedelete "github.com/cuebernetes/cuebectl/pkg/delete"
-
-	"github.com/cuebernetes/cuebectl/pkg/controller"
-	"github.com/ecordell/dyncr/imgbuild"
-	"github.com/ecordell/dyncr/provision"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/client-go/dynamic"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	//"time"
 
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/load"
+	"github.com/cuebernetes/cuebectl/pkg/apply"
+	"github.com/cuebernetes/cuebectl/pkg/controller"
+	cuedelete "github.com/cuebernetes/cuebectl/pkg/delete"
 	flag "github.com/spf13/pflag"
-	//"github.com/bep/debounce"
-	//"github.com/txn2/kubefwd/pkg/fwdcfg"
-	//"github.com/txn2/kubefwd/pkg/fwdhost"
-	//"github.com/txn2/kubefwd/pkg/fwdport"
-	//"github.com/txn2/kubefwd/pkg/fwdservice"
-	//"kubefwd/cmd/kubefwd/services"
-	//"github.com/txn2/kubefwd/pkg/fwdsvcregistry"
-	//"github.com/txn2/kubefwd/pkg/utils"
-	//"github.com/txn2/txeh"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/dynamic"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 
+	"github.com/ecordell/dyncr/imgbuild"
+	"github.com/ecordell/dyncr/provision"
+	"github.com/ecordell/dyncr/runbin"
 )
 
-var images = flag.StringArray("kind.image", []string{}, "image archives to load on cluster nodes")
-var name = flag.String("kind.name", "", "name of an existing kind cluster")
 var cleanup = flag.Bool("cleanup", true, "if true, cleans up resources when process is killed")
 var cleanupCluster = flag.Bool("cleanup-cluster", true, "if true, cleans up cluster when process is killed")
 
@@ -69,27 +57,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	imgs, instance, err := imgbuild.Build(ctx, os.Stdout, r, instance)
+	instance, err = runbin.Run(ctx, os.Stdout, r, instance)
+	if err != nil {
+		log.Fatalf("error building binaries: %v", err)
+	}
+
+	instance, err = imgbuild.Build(ctx, os.Stdout, r, instance)
 	if err != nil {
 		log.Fatalf("error building images: %v", err)
 	}
 
-	archives := make([]string, 0)
-	for _, img := range imgs {
-		if img.ArchiveName != "" {
-			archives = append(archives, img.ArchiveName)
-		}
-	}
-
-	//out, err := format.Node(instance.Value().Syntax())
-	//if err != nil {
-	//	log.Fatal(err)
-	//}
-	//fmt.Println(string(out))
-
-	// TODO: to replace make commands, this needs to thread the image name from the image build into the manifests
-
-	deprovision, err := provision.Provision(*name, kubeconfig, archives)
+	deprovision, instance, err := provision.Provision(ctx, os.Stdout, r, instance, kubeconfig)
 	defer func() {
 		if deprovision != nil && *cleanupCluster {
 			deprovision()
@@ -123,66 +101,6 @@ func main() {
 		}
 	}()
 
-
-
-	// TODO: switch to a continuous watch on CUE to drive kubefwd
-	//
-	//// reqs for kubefwd
-	//hasRoot, err := utils.CheckRoot()
-	//if !hasRoot || err != nil {
-	//	log.Fatal(err)
-	//}
-	//hostFile, err := txeh.NewHostsDefault()
-	//if err != nil {
-	//	log.Fatalf("HostFile error: %v\n", err)
-	//}
-	//_, err = fwdhost.BackupHostFile(hostFile)
-	//if err != nil {
-	//	log.Fatalf("Error backing up hostfile: %v\n", err)
-	//}
-	//go func() {
-	//	state := <-final
-	//
-	//
-	//	for id, obj := range state {
-	//		if id.GroupResource() == "services" {
-	//
-	//		}
-	//	}
-	//	fwdsvcregistry.Init(ctx.Done())
-	//
-	//	clientset, err := f.KubernetesClientSet()
-	//	if err != nil {
-	//		log.Fatal("couldn't get clientset")
-	//	}
-	//	clientConfig, err := f.ToRESTConfig()
-	//	if err != nil {
-	//		log.Fatal("couldn't get restconfig")
-	//	}
-	//	restClient, err := f.RESTClient()
-	//	if err != nil {
-	//		log.Fatal("couldn't get rest client")
-	//	}
-	//	svcfwd := &fwdservice.ServiceFWD{
-	//		ClientSet:            *clientset,
-	//		Context:              *name,
-	//		Namespace:            opts.Namespace,
-	//		Hostfile:             hostFile,
-	//		ClientConfig:         *clientConfig,
-	//		RESTClient:           restClient,
-	//		NamespaceN:           opts.NamespaceN,
-	//		ClusterN:             opts.ClusterN,
-	//		Domain:               opts.Domain,
-	//		PodLabelSelector:     selector,
-	//		NamespaceServiceLock: opts.NamespaceIPLock,
-	//		Svc:                  svc,
-	//		Headless:             svc.Spec.ClusterIP == "None",
-	//		PortForwards:         make(map[string]*fwdport.PortForwardOpts),
-	//		SyncDebouncer:        debounce.New(5 * time.Second),
-	//		DoneChannel:          make(chan struct{}),
-	//	}
-	//	fwdsvcregistry.Add(svcfwd)
-	//}()
 	<-c
 
 	if *cleanup && state != nil {
@@ -192,3 +110,72 @@ func main() {
 		}
 	}
 }
+
+// TODO: switch to a continuous watch on CUE to drive kubefwd
+//"time"
+//"github.com/bep/debounce"
+//"github.com/txn2/kubefwd/pkg/fwdcfg"
+//"github.com/txn2/kubefwd/pkg/fwdhost"
+//"github.com/txn2/kubefwd/pkg/fwdport"
+//"github.com/txn2/kubefwd/pkg/fwdservice"
+//"kubefwd/cmd/kubefwd/services"
+//"github.com/txn2/kubefwd/pkg/fwdsvcregistry"
+//"github.com/txn2/kubefwd/pkg/utils"
+//"github.com/txn2/txeh"
+//
+//// reqs for kubefwd
+//hasRoot, err := utils.CheckRoot()
+//if !hasRoot || err != nil {
+//	log.Fatal(err)
+//}
+//hostFile, err := txeh.NewHostsDefault()
+//if err != nil {
+//	log.Fatalf("HostFile error: %v\n", err)
+//}
+//_, err = fwdhost.BackupHostFile(hostFile)
+//if err != nil {
+//	log.Fatalf("Error backing up hostfile: %v\n", err)
+//}
+//go func() {
+//	state := <-final
+//
+//
+//	for id, obj := range state {
+//		if id.GroupResource() == "services" {
+//
+//		}
+//	}
+//	fwdsvcregistry.Init(ctx.Done())
+//
+//	clientset, err := f.KubernetesClientSet()
+//	if err != nil {
+//		log.Fatal("couldn't get clientset")
+//	}
+//	clientConfig, err := f.ToRESTConfig()
+//	if err != nil {
+//		log.Fatal("couldn't get restconfig")
+//	}
+//	restClient, err := f.RESTClient()
+//	if err != nil {
+//		log.Fatal("couldn't get rest client")
+//	}
+//	svcfwd := &fwdservice.ServiceFWD{
+//		ClientSet:            *clientset,
+//		Context:              *name,
+//		Namespace:            opts.Namespace,
+//		Hostfile:             hostFile,
+//		ClientConfig:         *clientConfig,
+//		RESTClient:           restClient,
+//		NamespaceN:           opts.NamespaceN,
+//		ClusterN:             opts.ClusterN,
+//		Domain:               opts.Domain,
+//		PodLabelSelector:     selector,
+//		NamespaceServiceLock: opts.NamespaceIPLock,
+//		Svc:                  svc,
+//		Headless:             svc.Spec.ClusterIP == "None",
+//		PortForwards:         make(map[string]*fwdport.PortForwardOpts),
+//		SyncDebouncer:        debounce.New(5 * time.Second),
+//		DoneChannel:          make(chan struct{}),
+//	}
+//	fwdsvcregistry.Add(svcfwd)
+//}()

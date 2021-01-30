@@ -43,20 +43,20 @@ type ImgBuild struct {
 	ArchiveName string `json:"archive"`
 }
 
-func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Instance) ([]ImgBuild, *cue.Instance, error) {
+func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Instance) (*cue.Instance, error) {
 	// load schema for image definitions
 	sis := load.Instances([]string{"."}, &load.Config{
 		Dir: "./manifests/imgbuild",
 	})
 	if len(sis) > 1 {
-		return nil, instance, fmt.Errorf("multiple instance loading currently not supported")
+		return instance, fmt.Errorf("multiple instance loading currently not supported")
 	}
 	if len(sis) < 1 {
-		return nil, instance, fmt.Errorf("no instances found")
+		return instance, fmt.Errorf("no instances found")
 	}
 	si, err := r.Build(sis[0])
 	if err != nil {
-		return nil, instance, err
+		return instance, err
 	}
 	binImageSchema := si.Value().LookupDef("GoBinImage")
 
@@ -64,7 +64,7 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 	imageDefs := make([]cue.Value, 0)
 	itr, err := instance.Value().Fields(cue.Definitions(true))
 	if err != nil {
-		return nil, instance, err
+		return instance, err
 	}
 	for itr.Next() {
 		val := itr.Value()
@@ -76,12 +76,11 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 		}
 	}
 
-	builtImages := make([]ImgBuild, 0)
 	for _, img := range imageDefs {
 		var imgspec ImgBuild
 
 		if err := img.Decode(&imgspec); err != nil {
-			return nil, instance, err
+			return instance, err
 		}
 		fmt.Println(imgspec)
 
@@ -94,11 +93,11 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 		// pull base images to a shared cache dir
 		srcRef, err := alltransports.ParseImageName(imgspec.Base.Ref)
 		if err != nil {
-			return nil, instance, fmt.Errorf("Invalid source name %s: %v", imgspec.Base.Ref, err)
+			return instance, fmt.Errorf("Invalid source name %s: %v", imgspec.Base.Ref, err)
 		}
 		destRef, err := alltransports.ParseImageName("oci:local:test")
 		if err != nil {
-			return nil, instance, fmt.Errorf("Invalid destination name %s: %v", "oci:local:test", err)
+			return instance, fmt.Errorf("Invalid destination name %s: %v", "oci:local:test", err)
 		}
 
 		if imgspec.Name == "" {
@@ -107,7 +106,7 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 
 		policyCtx, err := signature.NewPolicyContext(&signature.Policy{Default: []signature.PolicyRequirement{signature.NewPRInsecureAcceptAnything()}})
 		if err != nil {
-			return nil, instance, err
+			return instance, err
 		}
 		err = retry.RetryIfNecessary(ctx, func() error {
 			_, err = imgcopy.Image(ctx, policyCtx, destRef, srcRef, &imgcopy.Options{
@@ -124,31 +123,31 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 			Delay:    time.Second,
 		})
 		if err != nil {
-			return nil, instance, err
+			return instance, err
 		}
 
 		// unpack
 		engine, err := dir.Open("./local")
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "open CAS")
+			return instance, errors.Wrap(err, "open CAS")
 		}
 		engineExt := casext.NewEngine(engine)
 
 		descriptorPaths, err := engineExt.ResolveReference(context.Background(), "test")
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "get descriptor")
+			return instance, errors.Wrap(err, "get descriptor")
 		}
 		if len(descriptorPaths) == 0 {
-			return nil, instance, errors.Errorf("tag not found: %s", "test")
+			return instance, errors.Errorf("tag not found: %s", "test")
 		}
 		if len(descriptorPaths) != 1 {
-			return nil, instance, errors.Errorf("tag is ambiguous: %s", "test")
+			return instance, errors.Errorf("tag is ambiguous: %s", "test")
 		}
 
 		// Create the mutator.
 		mutator, err := mutate.New(engine, descriptorPaths[0])
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "create mutator for base image")
+			return instance, errors.Wrap(err, "create mutator for base image")
 		}
 
 		var meta umoci.Meta
@@ -169,58 +168,58 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 		}
 
 		if err := mutator.Add(ctx, reader, history); err != nil {
-			return nil, instance, errors.Wrap(err, "add diff layer")
+			return instance, errors.Wrap(err, "add diff layer")
 		}
 
 		imageConfig, err := mutator.Config(ctx)
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "get base config")
+			return instance, errors.Wrap(err, "get base config")
 		}
 
 		imageMeta, err := mutator.Meta(ctx)
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "get base metadata")
+			return instance, errors.Wrap(err, "get base metadata")
 		}
 		annotations, err := mutator.Annotations(ctx)
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "get base annotations")
+			return instance, errors.Wrap(err, "get base annotations")
 		}
 		imageConfig.ExposedPorts = exposedPorts
 
 		// TODO: set command
 
 		if err := mutator.Set(ctx, imageConfig, imageMeta, annotations, history); err != nil {
-			return nil, instance, errors.Wrap(err, "set modified configuration")
+			return instance, errors.Wrap(err, "set modified configuration")
 		}
 
 		newDescriptorPath, err := mutator.Commit(ctx)
 		if err != nil {
-			return nil, instance, errors.Wrap(err, "commit mutated image")
+			return instance, errors.Wrap(err, "commit mutated image")
 		}
 
 		fmt.Fprintf(out, "new image manifest created: %s->%s\n", newDescriptorPath.Root().Digest, newDescriptorPath.Descriptor().Digest)
 
 		if err := engineExt.UpdateReference(ctx, imgspec.Name, newDescriptorPath.Root()); err != nil {
-			return nil, instance, errors.Wrap(err, "add new tag")
+			return instance, errors.Wrap(err, "add new tag")
 		}
 		fmt.Fprintf(out, "updated tag for image manifest: %s\n", imgspec.Name)
 
 		if err := engine.Close(); err != nil {
-			return nil, instance, err
+			return instance, err
 		}
 
 		outRef, err := alltransports.ParseImageName("oci:local:" + imgspec.Name)
 		if err != nil {
-			return nil, instance, fmt.Errorf("invalid final image name %s: %v", imgspec.Name, err)
+			return instance, fmt.Errorf("invalid final image name %s: %v", imgspec.Name, err)
 		}
 
 		if imgspec.ArchiveName != "" {
 			if err := os.Remove(imgspec.ArchiveName); err != nil {
-				return nil, instance, fmt.Errorf("couldn't clear existing archive %s: %b", imgspec.ArchiveName, err)
+				return instance, fmt.Errorf("couldn't clear existing archive %s: %b", imgspec.ArchiveName, err)
 			}
 			tarRef, err := alltransports.ParseImageName("docker-archive:" + imgspec.ArchiveName)
 			if err != nil {
-				return nil, instance, fmt.Errorf("invalid tar name %s: %v", "docker-archive:" + imgspec.ArchiveName, err)
+				return instance, fmt.Errorf("invalid tar name %s: %v", "docker-archive:" + imgspec.ArchiveName, err)
 			}
 			_, err = imgcopy.Image(ctx, policyCtx, tarRef, outRef, &imgcopy.Options{
 				ReportWriter: out,
@@ -231,19 +230,18 @@ func Build(ctx context.Context, out io.Writer, r cue.Runtime, instance *cue.Inst
 				DestinationCtx: &types.SystemContext{},
 			})
 			if err != nil {
-				return nil, instance, err
+				return instance, err
 			}
 		}
 
 		fmt.Println("Filling instance", img.Path().String())
 		instance, err = instance.Fill(&imgspec, img.Path().String())
 		if err != nil {
-			return nil, instance, err
+			return instance, err
 		}
-		builtImages = append(builtImages, imgspec)
 	}
 
-	return builtImages, instance, nil
+	return instance, nil
 }
 
 // stolen from apimachinery

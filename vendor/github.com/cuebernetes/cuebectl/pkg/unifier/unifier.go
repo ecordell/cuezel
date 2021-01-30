@@ -57,7 +57,7 @@ func (u *ClusterUnifier) Fill(queue workqueue.RateLimitingInterface) (total int,
 		return
 	}
 	for itr.Next() {
-		if itr.Label() == "DyncrImage" {
+		if itr.Label() == "DyncrImage" || itr.Label() == "Cluster" || itr.Label() == "DyncrBin" {
 			continue
 		}
 		total++

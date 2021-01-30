@@ -2,9 +2,11 @@ package test
 
 import (
 	"context"
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/load"
 	"flag"
+	"github.com/ecordell/dyncr/imgbuild"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -37,9 +39,21 @@ var _ = BeforeSuite(func() {
 	flags := genericclioptions.NewConfigFlags(true)
 	f := cmdutil.NewFactory(flags)
 	kubeconfig := f.ToRawKubeConfigLoader().ConfigAccess().GetExplicitFile()
-	archives := strings.Split(*images, ",")
-	deprovision, err = provision.Provision("", kubeconfig, archives)
-	Expect(err).ToNot(HaveOccurred())
+
+	r := cue.Runtime{}
+	is := load.Instances([]string{"."}, &load.Config{
+		Dir: "../manifests",
+	})
+	Expect(is).To(HaveLen(1))
+
+	instance, err := r.Build(is[0])
+	Expect(err).To(Succeed())
+
+	instance, err = imgbuild.Build(context.TODO(), os.Stdout, r, instance)
+	Expect(err).To(Succeed())
+
+	deprovision, instance, err = provision.Provision(context.TODO(), os.Stdout, r, instance, kubeconfig)
+	Expect(err).To(Succeed())
 
 	k, err = f.DynamicClient()
 	Expect(err).To(Succeed())
@@ -51,7 +65,7 @@ var _ = BeforeSuite(func() {
 
 	mapper, err := f.ToRESTMapper()
 	Expect(err).To(Succeed())
-	_, err = apply.CueDir(context.Background(), os.Stdout, k, mapper, "../manifests", false)
+	_, err = apply.CueInstance(context.Background(), os.Stdout, k, mapper, &r, instance, false)
 	Expect(err).To(Succeed())
 })
 
